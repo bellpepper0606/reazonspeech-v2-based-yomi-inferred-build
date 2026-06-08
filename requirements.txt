@@ -1,0 +1,12 @@
+torch
+numpy
+jaconv
+kanjize
+python-Levenshtein
+tqdm
+nemo_toolkit[asr]
+huggingface_hub
+soundfile
+librosa
+fugashi
+unidic
