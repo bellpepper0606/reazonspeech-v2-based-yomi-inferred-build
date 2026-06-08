@@ -1,18 +1,18 @@
 # ==========================================
-# ReazonSpeech v2 読み推定データセット 構築参考スクリプト
+# ReazonSpeech v2 読み推定データセット 構築用スクリプト
 # ==========================================
 #
-# bellpepper0606/reazonspeech-v2-based-yomi-inferred の構築時に使った処理を、
-# 参考実装として整理したものです。
+# 本スクリプトは、bellpepper0606/reazonspeech-v2-based-yomi-inferred
+# の構築時に使用した処理を整理したものです。
 #
-# ReazonSpeech 公式データセットローダーの定義を参考に、シャード単位で音声を
-# 取得・処理し、処理後にローカルキャッシュを削除します。
+# ReazonSpeech 公式データセットローダーの定義を参照し、
+# シャード単位で音声を処理します。処理後の音声シャードは、
+# ローカルキャッシュから削除します。
 #
-# 注意:
-# - 実行者が reazon-research/reazonspeech の利用条件を確認し、同意していることを前提とします。
-# - このコードは派生データセット構築手順の透明性・再現性のための参考実装です。
-# - 処理過程では元の文字起こしを参照しますが、公開した派生データセットには
-#   元字幕テキストや形態素表層形を含めていません。
+# 本スクリプトは、reazon-research/reazonspeech の利用条件を確認し、
+# 同意した環境で実行することを前提とします。
+# 処理過程では元の文字起こしを参照しますが、公開している派生データセットには、
+# 元字幕テキストおよび形態素表層形は含めていません。
 # ==========================================
 
 import contextlib
@@ -41,13 +41,16 @@ from Levenshtein import distance as lev_dist
 from tqdm.auto import tqdm
 
 
+# ==========================================
+# 設定
+# ==========================================
 OUTPUT_DIR = "./output_data"
 SHARD_CACHE_DIR = "./shard_cache"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(SHARD_CACHE_DIR, exist_ok=True)
 
-# 注意: 以下の中間出力は構築検証用です。
-# 公開用データセットには元字幕テキストや表層形を含めないこと。
+# 以下の出力は構築時の中間結果です。
+# 公開用データセットでは、元字幕テキストおよび形態素表層形を除外します。
 OUTPUT_FILE_TSV = os.path.join(OUTPUT_DIR, "reazon_all_parakeet.tsv")
 OUTPUT_FILE_JSON = os.path.join(OUTPUT_DIR, "reazon_all_parakeet.jsonl")
 CHECKPOINT_FILE = os.path.join(OUTPUT_DIR, "checkpoint.json")
@@ -61,7 +64,7 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "24"))
 BATCH_TIMEOUT_SEC = float(os.environ.get("BATCH_TIMEOUT_SEC", "10.0"))
 
 # ReazonSpeech 公式ローダースクリプトで定義されている取得先。
-# ここでは構築時の再現性のため、同じ定義を参照する。
+# 構築時と同じ定義を参照します。
 BASE_URL = "https://corpus.reazon-research.org/"
 DATASET_INFO = {
     "tiny": {"tsv": "reazonspeech-v2/tsv/tiny.tsv", "audio": "reazonspeech-v2/data/{:03x}.tar", "nfiles": 1},
@@ -91,13 +94,13 @@ def suppress_stdout_stderr():
 
 
 def download_file(url, dest_path, max_retry=5):
-    """指定URLをローカルに保存する。失敗時は部分ファイルを削除してリトライする。"""
+    """指定したURLをローカルに保存します。失敗時は部分ファイルを削除してリトライします。"""
     for attempt in range(max_retry):
         try:
             urllib.request.urlretrieve(url, dest_path)
             return True
         except Exception as e:
-            print(f"  DL失敗 ({attempt + 1}/{max_retry}): {e}")
+            print(f"  ダウンロード失敗 ({attempt + 1}/{max_retry}): {e}")
             if os.path.exists(dest_path):
                 os.remove(dest_path)
             if attempt < max_retry - 1:
@@ -110,10 +113,13 @@ def load_checkpoint():
         try:
             with open(CHECKPOINT_FILE, "r") as f:
                 ckpt = json.load(f)
-            print(f"チェックポイントから再開: シャード {ckpt['shard_idx']}, 行 {ckpt['inner_idx']} (累計 {ckpt['total_processed']} 件)")
+            print(
+                f"チェックポイントから再開: シャード {ckpt['shard_idx']}, "
+                f"行 {ckpt['inner_idx']} (累計 {ckpt['total_processed']} 件)"
+            )
             return ckpt
         except Exception:
-            print("チェックポイント読み込み失敗。最初から開始します。")
+            print("チェックポイントを読み込めなかったため、最初から開始します。")
     return {"shard_idx": 0, "inner_idx": 0, "total_processed": 0}
 
 
@@ -123,7 +129,7 @@ def save_checkpoint(ckpt):
 
 
 def safe_extract(tar, path):
-    """tar展開時のパストラバーサルを避ける。"""
+    """tar展開時に、展開先が指定ディレクトリ配下に収まることを確認します。"""
     base = os.path.abspath(path)
     for member in tar.getmembers():
         target = os.path.abspath(os.path.join(path, member.name))
@@ -135,6 +141,7 @@ def safe_extract(tar, path):
 def extract_shard(tar_path, extract_dir):
     with tarfile.open(tar_path, "r") as t:
         safe_extract(t, extract_dir)
+
     audio_files = []
     for root, _, files in os.walk(extract_dir):
         for fname in files:
@@ -144,7 +151,7 @@ def extract_shard(tar_path, extract_dir):
 
 
 def _prefetch_worker(shard_idx, dataset_info, result):
-    """バックグラウンドで指定シャードを取得し、展開まで行う。"""
+    """指定シャードをバックグラウンドで取得し、展開まで行います。"""
     tar_url = BASE_URL + dataset_info["audio"].format(shard_idx)
     tar_path = os.path.join(SHARD_CACHE_DIR, f"shard_{shard_idx:04d}.tar")
     extract_dir = os.path.join(SHARD_CACHE_DIR, f"shard_{shard_idx:04d}")
@@ -156,7 +163,12 @@ def _prefetch_worker(shard_idx, dataset_info, result):
                 if fname.endswith((".flac", ".wav")):
                     audio_files.append(os.path.join(root, fname))
         if audio_files:
-            result.update({"ok": True, "tar_path": tar_path, "extract_dir": extract_dir, "audio_files": sorted(audio_files)})
+            result.update({
+                "ok": True,
+                "tar_path": tar_path,
+                "extract_dir": extract_dir,
+                "audio_files": sorted(audio_files),
+            })
             return
 
     if not os.path.exists(tar_path):
@@ -180,20 +192,31 @@ def _prefetch_worker(shard_idx, dataset_info, result):
         result.update({"ok": False, "tar_path": tar_path})
         return
 
-    result.update({"ok": True, "tar_path": tar_path, "extract_dir": extract_dir, "audio_files": audio_files})
+    result.update({
+        "ok": True,
+        "tar_path": tar_path,
+        "extract_dir": extract_dir,
+        "audio_files": audio_files,
+    })
 
 
 def start_prefetch(shard_idx, dataset_info, total_shards):
+    """指定シャードの先読みスレッドを起動します。"""
     if shard_idx >= total_shards:
         return None, None
+
     result = {"ok": False, "tar_path": None}
-    t = threading.Thread(target=_prefetch_worker, args=(shard_idx, dataset_info, result), daemon=True)
+    t = threading.Thread(
+        target=_prefetch_worker,
+        args=(shard_idx, dataset_info, result),
+        daemon=True,
+    )
     t.start()
     return t, result
 
 
 def load_tsv_index(tsv_path):
-    """ヘッダーなし filename\ttranscription 形式のTSVを読む。"""
+    """ヘッダーなし filename<TAB>transcription 形式のTSVを読み込みます。"""
     index = {}
     with open(tsv_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -227,6 +250,7 @@ def text_for_mecab(text):
 def process_batch(batch_data, model, tagger):
     results = []
     temp_files = []
+
     try:
         audio_paths = []
         for item in batch_data:
@@ -245,7 +269,14 @@ def process_batch(batch_data, model, tagger):
         for item, hyp in zip(batch_data, hypotheses):
             try:
                 raw_kanji = item["transcription"]
-                recognized_text = hyp.text if hasattr(hyp, "text") else hyp if isinstance(hyp, str) else ""
+                if hasattr(hyp, "text"):
+                    recognized_text = hyp.text
+                elif isinstance(hyp, str):
+                    recognized_text = hyp
+                else:
+                    print(f"\n認識結果の形式が不明 ({item['path']}): {hyp}")
+                    continue
+
                 if not recognized_text:
                     continue
 
@@ -261,7 +292,9 @@ def process_batch(batch_data, model, tagger):
                         if kana and kana != "*":
                             y_cand += kana
                         elif node.surface not in "。、？！ ":
-                            y_cand += "".join(re.findall(r"[\u30A0-\u30FF]+", jaconv.hira2kata(node.surface)))
+                            y_cand += "".join(
+                                re.findall(r"[\u30A0-\u30FF]+", jaconv.hira2kata(node.surface))
+                            )
                     d = lev_dist(y_pred, y_cand)
                     if d < best_dist:
                         best_dist, best_yomi, best_nodes = d, y_cand, nodes
@@ -277,7 +310,12 @@ def process_batch(batch_data, model, tagger):
                         kana_hira = jaconv.kata2hira(kana_raw) if (kana_raw and kana_raw != "*") else surface
                         pos = f.pos1 if f.pos1 != "*" else "未知語"
                         lemma = f.lemma if (f.lemma and f.lemma != "*") else surface
-                        tokens_json.append({"surface": surface, "kana": kana_hira, "pos": pos, "lemma": lemma})
+                        tokens_json.append({
+                            "surface": surface,
+                            "kana": kana_hira,
+                            "pos": pos,
+                            "lemma": lemma,
+                        })
 
                     results.append({
                         "id": os.path.basename(item["path"]),
@@ -296,23 +334,33 @@ def process_batch(batch_data, model, tagger):
                 os.remove(f)
             except OSError:
                 pass
+
     return results
 
 
 def reset_inference_engine():
+    """推論エンジンを再初期化します。"""
     global model, tagger
+
     print("\n[RESET] 推論エンジンをリセット中...")
+
     if model is not None:
         del model
     if tagger is not None:
         del tagger
+
     gc.collect()
     torch.cuda.empty_cache()
+
+    print("[RESET] モデルを再ロード...")
     model_path = hf_hub_download(repo_id=MODEL_ID, filename=MODEL_FILENAME, local_dir="./models")
     model = nemo_asr.models.EncDecHybridRNNTCTCBPEModel.restore_from(model_path)
     model.eval()
+
+    print("[RESET] 辞書を再ロード...")
     import unidic
     tagger = Tagger(f'-d "{unidic.DICDIR}"')
+
     print("[RESET] リセット完了\n")
 
 
@@ -322,8 +370,8 @@ if __name__ == "__main__":
 
     print(f"使用デバイス: {'GPU' if torch.cuda.is_available() else 'CPU'}")
     print(f"対象データセット: {DATASET_CONFIG} ({DATASET_INFO[DATASET_CONFIG]['nfiles']} シャード)")
-    print("注意: このスクリプトは構築参考用です。ReazonSpeechの利用条件に同意済みの環境で実行してください。")
-    print("注意: 中間出力には構築検証用の文字起こし情報が含まれます。公開用データ作成時は元字幕テキストを除外してください。")
+    print("本スクリプトは、ReazonSpeech の利用条件に同意した環境で実行することを前提とします。")
+    print("中間出力には構築時の文字起こし情報が含まれます。公開用データセットでは元字幕テキストを除外します。")
 
     print(f"\nモデルロード中: {MODEL_ID}")
     model_path = hf_hub_download(repo_id=MODEL_ID, filename=MODEL_FILENAME, local_dir="./models")
@@ -335,13 +383,12 @@ if __name__ == "__main__":
     tagger = Tagger(f'-d "{unidic.DICDIR}"')
     print("準備完了\n")
 
-    dataset_info = DATASET_INFO[DATASET_CONFIG]
-    tsv_url = BASE_URL + dataset_info["tsv"]
+    tsv_url = BASE_URL + DATASET_INFO[DATASET_CONFIG]["tsv"]
     tsv_path = os.path.join(SHARD_CACHE_DIR, f"{DATASET_CONFIG}.tsv")
     if not os.path.exists(tsv_path):
         print(f"TSVインデックスを取得中: {tsv_url}")
         if not download_file(tsv_url, tsv_path):
-            print("TSVのDLに失敗しました。終了します。")
+            print("TSVのダウンロードに失敗しました。終了します。")
             sys.exit(1)
 
     print("TSVインデックス読み込み中...")
@@ -349,11 +396,13 @@ if __name__ == "__main__":
     print(f"  {len(tsv_index)} 件のエントリを読み込みました")
 
     ckpt = load_checkpoint()
+
     f_tsv = open(OUTPUT_FILE_TSV, "a", encoding="utf-8")
     f_json = open(OUTPUT_FILE_JSON, "a", encoding="utf-8")
     if os.path.getsize(OUTPUT_FILE_TSV) == 0:
         f_tsv.write("id\tkanji\tyomi\tyomi_gold\tdist\n")
 
+    dataset_info = DATASET_INFO[DATASET_CONFIG]
     total_shards = dataset_info["nfiles"]
     total_samples = len(tsv_index)
     pbar = tqdm(total=total_samples, initial=ckpt["total_processed"], desc="Total")
@@ -380,23 +429,41 @@ if __name__ == "__main__":
 
             if not dl_ok:
                 print(f"  シャード {shard_idx} の取得/展開に失敗。スキップします。")
-                ckpt.update({"shard_idx": shard_idx + 1, "inner_idx": 0})
+                ckpt["shard_idx"] = shard_idx + 1
+                ckpt["inner_idx"] = 0
                 save_checkpoint(ckpt)
                 current_thread, current_result = next_thread, next_result
                 continue
 
-            audio_files = current_result.get("audio_files") if current_result else None
-            if audio_files is None:
-                os.makedirs(extract_dir, exist_ok=True)
-                audio_files = extract_shard(tar_path, extract_dir)
-            else:
+            if current_result and current_result.get("audio_files") is not None:
+                audio_files = current_result["audio_files"]
                 extract_dir = current_result["extract_dir"]
+            else:
+                os.makedirs(extract_dir, exist_ok=True)
+                try:
+                    audio_files = extract_shard(tar_path, extract_dir)
+                except Exception as e:
+                    print(f"  展開エラー: {e}. スキップします。")
+                    ckpt["shard_idx"] = shard_idx + 1
+                    ckpt["inner_idx"] = 0
+                    save_checkpoint(ckpt)
+                    if os.path.exists(tar_path):
+                        os.remove(tar_path)
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+                    current_thread, current_result = next_thread, next_result
+                    continue
 
             print(f"  {len(audio_files)} ファイル展開完了")
+
             start_inner = ckpt["inner_idx"] if shard_idx == ckpt["shard_idx"] else 0
             files_to_process = audio_files[start_inner:]
             batch_data = []
-            shard_pbar = tqdm(total=len(audio_files), initial=start_inner, desc=f"Shard {shard_idx + 1}/{total_shards}", leave=False)
+            shard_pbar = tqdm(
+                total=len(audio_files),
+                initial=start_inner,
+                desc=f"Shard {shard_idx + 1}/{total_shards}",
+                leave=False,
+            )
 
             for inner_offset, audio_path in enumerate(files_to_process):
                 inner_idx = start_inner + inner_offset
@@ -410,39 +477,61 @@ if __name__ == "__main__":
                     shard_pbar.update(1)
                     continue
 
-                batch_data.append({"path": audio_path, "transcription": transcription, "audio": audio_arr, "sr": sr})
+                batch_data.append({
+                    "path": audio_path,
+                    "transcription": transcription,
+                    "audio": audio_arr,
+                    "sr": sr,
+                })
 
                 if len(batch_data) >= BATCH_SIZE:
                     batch_start_time = time.time()
                     batch_results = process_batch(batch_data, model, tagger)
                     elapsed_time = time.time() - batch_start_time
                     if elapsed_time > BATCH_TIMEOUT_SEC:
-                        print(f"\n[RESET] 処理遅延検知 ({elapsed_time:.2f}s / {BATCH_TIMEOUT_SEC}s limit)。モデルをリセットします。")
+                        print(
+                            f"\n[RESET] 処理遅延検知 "
+                            f"({elapsed_time:.2f}s / {BATCH_TIMEOUT_SEC}s limit)。モデルをリセットします。"
+                        )
                         reset_inference_engine()
 
                     n_sent = len(batch_data)
+                    del batch_data
                     batch_data = []
+
                     for res in batch_results:
                         f_tsv.write(f"{res['id']}\t{res['kanji']}\t{res['yomi']}\t{res['yomi_gold']}\t{res['dist']}\n")
                         f_json.write(json.dumps(res, ensure_ascii=False) + "\n")
-                    f_tsv.flush(); f_json.flush()
+                    f_tsv.flush()
+                    f_json.flush()
+
                     ckpt["inner_idx"] = inner_idx + 1
                     ckpt["total_processed"] += n_sent
                     save_checkpoint(ckpt)
-                    pbar.update(n_sent); shard_pbar.update(n_sent)
+
+                    pbar.update(n_sent)
+                    shard_pbar.update(n_sent)
 
             if batch_data:
                 batch_results = process_batch(batch_data, model, tagger)
                 n_sent = len(batch_data)
+                del batch_data
+                batch_data = []
+
                 for res in batch_results:
                     f_tsv.write(f"{res['id']}\t{res['kanji']}\t{res['yomi']}\t{res['yomi_gold']}\t{res['dist']}\n")
                     f_json.write(json.dumps(res, ensure_ascii=False) + "\n")
-                f_tsv.flush(); f_json.flush()
+                f_tsv.flush()
+                f_json.flush()
+
                 ckpt["total_processed"] += n_sent
-                pbar.update(n_sent); shard_pbar.update(n_sent)
+                pbar.update(n_sent)
+                shard_pbar.update(n_sent)
 
             shard_pbar.close()
-            ckpt.update({"shard_idx": shard_idx + 1, "inner_idx": 0})
+
+            ckpt["shard_idx"] = shard_idx + 1
+            ckpt["inner_idx"] = 0
             save_checkpoint(ckpt)
             print(f"  シャード {shard_idx + 1} 完了 (累計 {ckpt['total_processed']} 件)")
 
@@ -460,6 +549,7 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         print("\nユーザーによる中断")
+
     finally:
         pbar.close()
         f_tsv.close()
